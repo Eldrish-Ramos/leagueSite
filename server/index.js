@@ -65,7 +65,126 @@ app.get('/api/account/:gameName/:tagLine', async (req, res) => {
       account: accountData,
       summoner: summonerData,
       ranked: rankedData,
+      iconId: summonerData.profileIconId,
     });
+  } catch (err) {
+    console.error('Server error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/matches/:puuid', async (req, res) => {
+  const { puuid } = req.params;
+  const count = parseInt(req.query.count, 10) || 8;
+  const apiKey = process.env.RIOT_API_KEY;
+
+  try {
+    // Step 1: Get recent match IDs
+    const matchIdsRes = await fetch(
+      `https://americas.api.riotgames.com/lol/match/v5/matches/by-puuid/${encodeURIComponent(puuid)}/ids?start=0&count=${count}`,
+      {
+        headers: {
+          'X-Riot-Token': apiKey,
+        },
+      }
+    );
+    if (!matchIdsRes.ok) {
+      const text = await matchIdsRes.text();
+      return res.status(matchIdsRes.status).json({ error: 'Failed to fetch match IDs', details: text });
+    }
+    const matchIds = await matchIdsRes.json();
+
+    // Step 2: Fetch match details for each match ID
+    const matchPromises = matchIds.map(async (matchId) => {
+      const matchRes = await fetch(
+        `https://americas.api.riotgames.com/lol/match/v5/matches/${matchId}`,
+        {
+          headers: {
+            'X-Riot-Token': apiKey,
+          },
+        }
+      );
+      if (!matchRes.ok) return null;
+      const matchData = await matchRes.json();
+
+      let purchaseHistory = [];
+      try {
+        const timelineRes = await fetch(
+          `https://americas.api.riotgames.com/lol/match/v5/matches/${matchId}/timeline`,
+          {
+            headers: {
+              'X-Riot-Token': apiKey,
+            },
+          }
+        );
+        if (timelineRes.ok) {
+          const timeline = await timelineRes.json();
+          const participantId = matchData.metadata.participants.indexOf(puuid) + 1;
+          timeline.info.frames.forEach(frame => {
+            frame.events.forEach(event => {
+              if (
+                event.type === 'ITEM_PURCHASED' &&
+                event.participantId === participantId
+              ) {
+                purchaseHistory.push({
+                  minute: Math.floor(event.timestamp / 60000),
+                  second: Math.floor((event.timestamp % 60000) / 1000),
+                  itemId: event.itemId,
+                  // Optionally, you can map itemId to itemName using Data Dragon or a static file
+                  itemName: null
+                });
+              }
+            });
+          });
+        }
+      } catch (e) {
+        // Ignore timeline errors, just don't provide purchaseHistory
+      }
+
+      // Find participant for this puuid
+      const participant = matchData.info.participants.find(p => p.puuid === puuid);
+      if (!participant) return null;
+
+      // Format duration as mm:ss
+      const durationSec = matchData.info.gameDuration;
+      const duration = `${Math.floor(durationSec / 60)}:${String(durationSec % 60).padStart(2, '0')}`;
+
+      // Get queue type (optional: you can map queueId to a name if you want)
+      let queue = matchData.info.queueId;
+      if (queue === 420) queue = 'Ranked Solo';
+      else if (queue === 440) queue = 'Ranked Flex';
+      else if (queue === 430) queue = 'Normal Blind';
+      else if (queue === 400) queue = 'Normal Draft';
+      else queue = 'Game';
+
+      const items = [
+        participant.item0,
+        participant.item1,
+        participant.item2,
+        participant.item3,
+        participant.item4,
+        participant.item5,
+        participant.item6
+      ];
+
+      return {
+        matchId,
+        queue,
+        result: participant.win ? 'Win' : 'Loss',
+        championName: participant.championName,
+        kills: participant.kills,
+        deaths: participant.deaths,
+        assists: participant.assists,
+        cs: participant.totalMinionsKilled + participant.neutralMinionsKilled,
+        duration,
+        items,
+        purchaseHistory,
+      };
+    });
+
+    const matches = (await Promise.all(matchPromises)).filter(Boolean);
+
+    res.json({ matches });
   } catch (err) {
     console.error('Server error:', err);
     res.status(500).json({ error: 'Server error' });
